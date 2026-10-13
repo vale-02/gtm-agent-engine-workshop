@@ -34,6 +34,15 @@ from . import data_service
 from .data_service import REP_IDS
 
 MODEL_NAME = "gpt-4o-mini"
+SENSITIVE_FIELDS = ("billing_qualification",)
+SCORING_FIELDS = (
+    "prospect_id",
+    "name",
+    "account_details",
+    "annual_revenue",
+    "tech_stack",
+    "engagement_history",
+)
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -52,13 +61,17 @@ def build_prospect_profile(prospect_id: str) -> dict:
     "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
     existing = data_service.get_profile_from_db(prospect_id)["prospect_profile"]
     if existing is not None:
+        sanitized = {k: v for k, v in existing.items() if k not in SENSITIVE_FIELDS}
+        if sanitized != existing:
+            data_service.save_profile_to_db(prospect_id, sanitized)
+            existing = sanitized
         return {"prospect_profile": existing, "found": True}
     rec = data_service.get_prospect_record(prospect_id)
     if rec is None:
         return {"prospect_profile": None, "found": False}
     built = {
         "prospect_id": prospect_id,
-        **rec,
+        **{k: v for k, v in rec.items() if k not in SENSITIVE_FIELDS},
         "engagement_history": data_service.fetch_engagement_history(prospect_id),
         "account_details": data_service.fetch_account_details(prospect_id),
         "tech_stack": data_service.fetch_tech_stack(prospect_id),
@@ -104,16 +117,17 @@ def _offering_has_required_fields(offering):
 
 @tool
 def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
-    "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
+    "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass prospect_id, name, account_details, annual_revenue, tech_stack, and engagement_history with the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
     if offering is None or not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
     # Score against the prospect's saved tech stack of record.
     pid = prospect_profile.get("prospect_id")
+    scoring_profile = {k: v for k, v in prospect_profile.items() if k in SCORING_FIELDS}
     if pid is not None:
-        prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
+        scoring_profile["tech_stack"] = data_service.fetch_tech_stack(pid)
     user = (
         "Offering:\n" + json.dumps(offering, indent=2) +
-        "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
+        "\n\nProspect profile:\n" + json.dumps(scoring_profile, indent=2)
     )
     result = _scoring_llm.invoke([
         {"role": "system", "content": SCORING_PROMPT},
@@ -132,8 +146,11 @@ def get_prospect(prospect_id: str) -> dict:
     # caller can pull from build_prospect_profile instead.
     contact = {
         "prospect_id": prospect_id,
-        **{k: v for k, v in record.items()
-           if k not in ("engagement_history", "account_details", "tech_stack")},
+        **{
+            k: v for k, v in record.items()
+            if k not in SENSITIVE_FIELDS
+            and k not in ("engagement_history", "account_details", "tech_stack")
+        },
     }
     return {"prospect": contact, "found": True}
 
